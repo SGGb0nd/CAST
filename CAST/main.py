@@ -19,7 +19,7 @@ def CAST_MARK(coords_raw_t,exp_dict_t,output_path_t,task_name_t = None,gpu_t = N
         graph_dgl_t = delaunay_dgl(sample_t,coords_raw_t[sample_t],output_path_t,if_plot=if_plot,strategy_t = graph_strategy).to(device)
         feat_torch_t = torch.tensor(exp_dict_t[sample_t], dtype=torch.float32, device=device)
         inputs.append((sample_t, graph_dgl_t, feat_torch_t))
-    
+
     ### parameters setting
     if args is None:
         args = Args(
@@ -53,7 +53,7 @@ def CAST_MARK(coords_raw_t,exp_dict_t,output_path_t,task_name_t = None,gpu_t = N
     print(f'The embedding, log, model files were saved to {output_path_t}')
     return embed_dict
 
-def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tmp1_f1_idx = None, mid_visual = False, sub_node_idxs = None, rescale = False, corr_q_r = None, if_embed_sub = False, early_stop_thres = None, renew_mesh_trans = True):
+def CAST_STACK(coords_raw, embed_dict, output_path, graph_list, params_dist= None,tmp1_f1_idx = None, mid_visual = False, sub_node_idxs = None, rescale = False, corr_q_r = None, if_embed_sub = False, early_stop_thres = None, renew_mesh_trans = True):
     ### setting parameters
     query_sample = graph_list[0]
     ref_sample = graph_list[1]
@@ -76,7 +76,7 @@ def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tm
                                     bleeding=500,
                                     d_list = [3,2,1,1/2,1/3],
                                     attention_params = [None,3,1,0],
-                                    #### FFD parameters                                    
+                                    #### FFD parameters
                                     dist_penalty2 = [0],
                                     alpha_basis_bs = [500],
                                     meshsize = [8],
@@ -90,48 +90,95 @@ def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tm
     plt.rcParams['axes.grid'] = False
 
     ### Generate correlation matrix of the graph embedding
-    if corr_q_r is None: 
-        if if_embed_sub:
-            corr_q_r = corr_dist(embed_dict[query_sample].cpu()[sub_node_idxs[query_sample]], embed_dict[ref_sample].cpu()[sub_node_idxs[ref_sample]]) 
-        else:
-            corr_q_r = corr_dist(embed_dict[query_sample].cpu(), embed_dict[ref_sample].cpu())
-    else:
-        corr_q_r = corr_q_r
-    
+    # if corr_q_r is None:
+    #     if if_embed_sub:
+    #         corr_q_r = corr_dist(embed_dict[query_sample].cpu()[sub_node_idxs[query_sample]], embed_dict[ref_sample].cpu()[sub_node_idxs[ref_sample]])
+    #     else:
+    #         corr_q_r = corr_dist(embed_dict[query_sample].cpu(), embed_dict[ref_sample].cpu())
+    # else:
+    #     corr_q_r = corr_q_r
+
     # Plot initial coordinates
     kmeans_plot_multiple(embed_dict,graph_list,coords_raw,prefix_t,output_path,k=15,dot_size = 10) if mid_visual else None
-    corr_heat(coords_raw[query_sample][sub_node_idxs[query_sample]],coords_raw[ref_sample][sub_node_idxs[ref_sample]],corr_q_r,output_path,filename=prefix_t+'_corr') if mid_visual else None
+    # corr_heat(coords_raw[query_sample][sub_node_idxs[query_sample]],coords_raw[ref_sample][sub_node_idxs[ref_sample]],corr_q_r,output_path,filename=prefix_t+'_corr') if mid_visual else None
     plot_mid(coords_raw[query_sample],coords_raw[ref_sample],output_path,f'{prefix_t}_raw')
 
     ### Initialize the coordinates and tensor
-    corr_q_r = torch.Tensor(corr_q_r).to(params_dist.device)
+    # ref_anchors = np.unique(np.argsort(corr_q_r, axis=1)[-50:][::-1])
+    # print(ref_anchors.shape)
+    # corr_q_r = corr_q_r[:, ref_anchors]
+    # corr_q_r = torch.from_numpy(corr_q_r).float().to(params_dist.device)
     params_dist.mean_q = coords_raw[query_sample].mean(0)
     params_dist.mean_r = coords_raw[ref_sample].mean(0)
-    coords_query = torch.Tensor(coords_minus_mean(coords_raw[query_sample])).to(params_dist.device)
-    coords_ref = torch.Tensor(coords_minus_mean(coords_raw[ref_sample])).to(params_dist.device)
 
+    coords_query = torch.from_numpy(
+        coords_minus_mean(coords_raw[query_sample])
+    ).to(params_dist.device)
+
+    coords_ref = torch.from_numpy(
+        coords_minus_mean(coords_raw[ref_sample])
+    ).to(params_dist.device)
+
+    coords_ref = coords_ref.float()
+    coords_query = coords_query.float()
+
+    emb_q = embed_dict[query_sample]
+    if not isinstance(emb_q := embed_dict[query_sample], torch.Tensor):
+        emb_q = torch.from_numpy(emb_q)
+
+    if not isinstance(emb_r := embed_dict[ref_sample], torch.Tensor):
+        emb_r = torch.from_numpy(emb_r)
+
+    corr_clip = corr_max_chunked(emb_q.cpu().numpy(),
+                                 emb_r.cpu().numpy())
     ### Pre-location
-    theta_r1_t = prelocate(coords_query,coords_ref,max_minus_value_t(corr_q_r),params_dist.bleeding,output_path,d_list=params_dist.d_list,prefix = prefix_t,index_list=[sub_node_idxs[k_t] for k_t in graph_list],translation_params = params_dist.translation_params,mirror_t=params_dist.mirror_t)
+    theta_r1_t = prelocate(
+        coords_query,
+        coords_ref,
+        emb_q,
+        emb_r,
+        corr_clip,
+        params_dist.bleeding,
+        output_path,
+        d_list=params_dist.d_list,
+        prefix = prefix_t,
+        index_list=[sub_node_idxs[k_t] for k_t in graph_list],
+        translation_params = params_dist.translation_params,
+        mirror_t=params_dist.mirror_t
+    )
+    print("Prelocated parameters:\n"
+        f"X scale: {theta_r1_t.squeeze()[0]}\n"
+        f"Y scale: {theta_r1_t.squeeze()[1]}\n"
+        f"Rotation Angle: {theta_r1_t.squeeze()[2]}\n"
+        f"X translation: {theta_r1_t.squeeze()[3]}\n"
+        f"Y translation: {theta_r1_t.squeeze()[4]}"
+    )
     params_dist.theta_r1 = theta_r1_t
     coords_query_r1 = affine_trans_t(params_dist.theta_r1,coords_query)
     plot_mid(coords_query_r1.cpu(),coords_ref.cpu(),output_path,prefix_t + '_prelocation') if mid_visual else None ### consistent scale with ref coords
 
     ### Affine
     output_list = Affine_GD(coords_query_r1,
-                        coords_ref,
-                        max_minus_value_t(corr_q_r),
-                        output_path,
-                        params_dist.bleeding,
-                        params_dist.dist_penalty1,
-                        alpha_basis = params_dist.alpha_basis,
-                        iterations = params_dist.iterations,
-                        prefix=prefix_t,
-                        attention_params = params_dist.attention_params,
-                        coords_log = True,
-                        index_list=[sub_node_idxs[k_t] for k_t in graph_list],
-                        mid_visual = mid_visual,
-                        early_stop_thres = early_stop_thres,
-                        ifrigid=params_dist.ifrigid)
+                    coords_ref,
+                    # max_minus_value_t(corr_q_r),
+                    emb_q,
+                    emb_r,
+                    corr_clip,
+                    params_dist.theta_r1,
+                    None,
+                    output_path,
+                    params_dist.bleeding,
+                    params_dist.dist_penalty1,
+                    alpha_basis = params_dist.alpha_basis,
+                    iterations = params_dist.iterations,
+                    prefix=prefix_t,
+                    attention_params = params_dist.attention_params,
+                    coords_log = True,
+                    index_list=[sub_node_idxs[k_t] for k_t in graph_list],
+                    mid_visual = mid_visual,
+                    early_stop_thres = early_stop_thres,
+                    diff_step=params_dist.diff_step_affine,
+                    ifrigid=params_dist.ifrigid)
 
     similarity_score,it_J,it_theta,coords_log = output_list
     params_dist.theta_r2 = it_theta[-1]
@@ -149,7 +196,8 @@ def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tm
     coords_query_r2 = affine_trans_t(params_dist.theta_r2,coords_query_r1)
     register_result(coords_query_r2.cpu().detach().numpy(),
                     coords_ref.cpu().detach().numpy(),
-                    max_minus_value_t(corr_q_r).cpu(),
+                    # max_minus_value_t(corr_q_r).cpu(),
+                    emb_q, emb_r, corr_clip,
                     params_dist.bleeding,
                     embed_stack_t,
                     output_path,
@@ -157,9 +205,9 @@ def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tm
                     prefix=prefix_t,
                     scale_t=1,
                     index_list=[sub_node_idxs[k_t] for k_t in graph_list])# if mid_visual else None
-    
+
     if params_dist.iterations_bs[round_t] != 0:
-        ### B-Spline free-form deformation 
+        ### B-Spline free-form deformation
         padding_rate = params_dist.PaddingRate_bs # by default, 0
         coords_query_r2_min = coords_query_r2.min(0)[0] # The x and y min of the query coords
         coords_query_r2_tmp = coords_minus_min_t(coords_query_r2) # min of the x and y is 0
@@ -169,7 +217,11 @@ def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tm
         params_dist.min_qr2 = [adj_min_qr2]
         t1 = BSpline_GD(coords_query_r2 - params_dist.min_qr2[round_t],
                         coords_ref - params_dist.min_qr2[round_t],
-                        max_minus_value_t(corr_q_r),
+                        # max_minus_value_t(corr_q_r),
+                        emb_q,
+                        emb_r,
+                        corr_clip,
+                        None,
                         params_dist.iterations_bs[round_t],
                         output_path,
                         params_dist.bleeding,
@@ -187,7 +239,12 @@ def CAST_STACK(coords_raw,embed_dict,output_path,graph_list,params_dist= None,tm
                         renew_mesh_trans = renew_mesh_trans)
 
         # B-Spline FFD results
-        register_result(t1[0].cpu().numpy(),(coords_ref - params_dist.min_qr2[round_t]).cpu().numpy(),max_minus_value_t(corr_q_r).cpu(),params_dist.bleeding,embed_stack_t,output_path,k=20,prefix=prefix_t+ '_' + str(round_t) +'_BSpine_' + str(params_dist.iterations_bs[round_t]),index_list=[sub_node_idxs[k_t] for k_t in graph_list])# if mid_visual else None
+        register_result(t1[0].cpu().numpy(),
+                        (coords_ref - params_dist.min_qr2[round_t]).cpu().numpy(),
+                        emb_q, emb_r, corr_clip,
+                        params_dist.bleeding,embed_stack_t,
+                        output_path,k=20,
+                        prefix=prefix_t+ '_' + str(round_t) +'_BSpine_' + str(params_dist.iterations_bs[round_t]),index_list=[sub_node_idxs[k_t] for k_t in graph_list])# if mid_visual else None
         # register_result(t1[0].cpu().numpy(),(coords_ref - coords_query_r2.min(0)[0]).cpu().numpy(),max_minus_value_t(corr_q_r).cpu(),params_dist.bleeding,embed_stack_t,output_path,k=20,prefix=prefix_t+ '_' + str(round_t) +'_BSpine_' + str(params_dist.iterations_bs[round_t]),index_list=[sub_node_idxs[k_t] for k_t in graph_list])# if mid_visual else None
         result_log['BS_coords_log1'] = t1[4]
         result_log['BS_J1'] = t1[3]
@@ -264,9 +321,9 @@ def CAST_PROJECT(
     source_cell_pc_feature = sdata_inte[idx_source, :].obsm[pc_feature]
     target_cell_pc_feature = sdata_inte[idx_target, :].obsm[pc_feature]
     sdata_ref,output_list = space_project(
-        sdata_inte = sdata_inte,
-        idx_source = idx_source,
-        idx_target = idx_target,
+        sdata_inte=sdata_inte,
+        idx_source=idx_source,
+        idx_target=idx_target,
         raw_layer = raw_layer,
         source_sample = source_sample,
         target_sample = target_sample,

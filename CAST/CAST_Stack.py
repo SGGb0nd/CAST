@@ -3,9 +3,11 @@ from tqdm import trange
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
+from sklearn.neighbors import KDTree, BallTree
 import seaborn as sns
 from dataclasses import dataclass, field
 from .visualize import add_scale_bar
+from scipy.spatial.distance import correlation
 
 #################### Registration ####################
 # Parameters class
@@ -14,6 +16,7 @@ from .visualize import add_scale_bar
 class reg_params:
     dataname : str
     ### affine
+    diff_step_affine : float = 5
     theta_r1 : float = 0
     theta_r2 : float = 0
     d_list : list[float] = field(default_factory=list)
@@ -45,7 +48,8 @@ class reg_params:
     gpu: int = 0
     device : str = field(init=False)
     ifrigid : bool = False
-    
+    K: int = 20
+
     def __post_init__(self):
         if self.gpu != -1 and torch.cuda.is_available():
             self.device = 'cuda:{}'.format(self.gpu)
@@ -57,7 +61,9 @@ def get_range(sp_coords):
     xrng = max(sp_coords, key=lambda x:x[0])[0] - min(sp_coords, key=lambda x:x[0])[0]
     return xrng, yrng
 
-def prelocate(coords_q,coords_r,cov_anchor_it,bleeding,output_path,d_list=[1,2,3],prefix = 'test',ifplot = True,index_list = None,translation_params = None,mirror_t = None):
+def prelocate(coords_q,coords_r,
+              emb_q, emb_r, corr_clip,
+              bleeding,output_path,d_list=[1,2,3],prefix = 'test',ifplot = True,index_list = None,translation_params = None,mirror_t = None):
     idx_q = np.ones(coords_q.shape[0],dtype=bool) if index_list is None else index_list[0]
     idx_r = np.ones(coords_r.shape[0],dtype=bool) if index_list is None else index_list[1]
     mirror_t = [1,-1] if mirror_t is None else mirror_t
@@ -83,32 +89,60 @@ def prelocate(coords_q,coords_r,cov_anchor_it,bleeding,output_path,d_list=[1,2,3
                         theta = torch.Tensor([a,d,phi,dx,dy]).reshape(5,1).to(coords_q.device)
                         coords_query_it = affine_trans_t(theta,coords_q)
                         try:
-                            J_t.append(J_cal(coords_query_it[idx_q],coords_r[idx_r],cov_anchor_it,bleeding).sum().item())
+                            J_t.append(J_cal(coords_query_it[idx_q],coords_r[idx_r],
+                                             emb_q, emb_r, corr_clip,
+                                             bleeding=bleeding).sum().item())
                         except:
-                            continue
+                            raise
                         theta_t.append(theta)
     if ifplot:
         prelocate_loss_plot(J_t,output_path,prefix)
     return(theta_t[np.argmin(J_t)])
 
-def Affine_GD(coords_query_it_raw,coords_ref_it,cov_anchor_it,output_path,bleeding=500, dist_penalty = 0,diff_step = 50,alpha_basis = np.reshape(np.array([0,0,1/5,2,2]),[5,1]),iterations = 50,prefix='test',attention_params = [None,3,1,0],scale_t = 1,coords_log = False,index_list = None, mid_visual = False,early_stop_thres = 1, ifrigid = False):
+def Affine_GD(coords_query_it_raw,coords_ref_it,
+              emb_q,
+              emb_r,
+              corr_clip,
+              theta=None,
+              cov_anchor_it=None,
+              output_path=None,
+              bleeding=500,
+              dist_penalty = 0,
+              diff_step = 1,
+              alpha_basis = np.reshape(np.array([0,0,1/5,2,2]),[5,1]),
+              iterations = 50,
+              prefix='test',
+              attention_params = [None,3,1,0],
+              scale_t = 1,
+              coords_log = False,
+              index_list = None,
+              mid_visual = False,
+              early_stop_thres = 1,
+              ifrigid = False):
     idx_q = np.ones(coords_query_it_raw.shape[0],dtype=bool) if index_list is None else index_list[0]
     idx_r = np.ones(coords_ref_it.shape[0],dtype=bool) if index_list is None else index_list[1]
     dev = coords_query_it_raw.device
-    theta = torch.Tensor([1,1,0,0,0]).reshape(5,1).to(dev) # initial theta, [a,d,phi,t1,t2]
+    if theta is None:
+        theta = torch.Tensor([1,1,0,0,0]).reshape(5,1).to(dev) # initial theta, [a,d,phi,t1,t2]
     coords_query_it = coords_query_it_raw.clone()
     plot_mid(coords_query_it.cpu() * scale_t,coords_ref_it.cpu() * scale_t,output_path,prefix + '_init',scale_bar_t=None) if mid_visual else None
-    similarity_score = [J_cal(coords_query_it[idx_q],coords_ref_it[idx_r],cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()]
+    similarity_score = [J_cal(coords_query_it[idx_q],coords_ref_it[idx_r],
+                                emb_q, emb_r, corr_clip,
+                              cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()]
     it_J = []
     it_theta = []
     coords_q_log = []
     delta_similarity_score = [np.inf] * 5
+    if iterations < 1:
+        return([similarity_score,it_J,it_theta,coords_q_log])
     t = trange(iterations, desc='', leave=True)
+    print(theta)
     for it in t:
         alpha = alpha_init(alpha_basis,it,dev)
         ## de_sscore
         dJ_dxy_mat = dJ_dt_cal(coords_query_it[idx_q],
                       coords_ref_it[idx_r],
+                    emb_q, emb_r, corr_clip,
                       diff_step,
                       dev,
                       cov_anchor_it,
@@ -120,6 +154,7 @@ def Affine_GD(coords_query_it_raw,coords_ref_it,cov_anchor_it,output_path,bleedi
                                   coords_query_it[idx_q,1],
                                   dJ_dxy_mat,theta,dev,ifrigid = ifrigid)
         theta = theta_renew(theta,dJ_dtheta,alpha,ifrigid = ifrigid)
+        print(theta)
 
         coords_query_it = affine_trans_t(theta,coords_query_it_raw)
         it_J.append(dJ_dtheta)
@@ -127,7 +162,9 @@ def Affine_GD(coords_query_it_raw,coords_ref_it,cov_anchor_it,output_path,bleedi
         if coords_log:
             coords_q_log.append(coords_query_it.detach().cpu().numpy())
 
-        sscore_t = J_cal(coords_query_it[idx_q],coords_ref_it[idx_r],cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()
+        sscore_t = J_cal(coords_query_it[idx_q],coords_ref_it[idx_r],
+                         emb_q, emb_r, corr_clip,
+                         cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()
         # print(f'Loss: {sscore_t}')
         t.set_description(f'Loss: {sscore_t:.3f}')
         t.refresh()
@@ -142,7 +179,9 @@ def Affine_GD(coords_query_it_raw,coords_ref_it,cov_anchor_it,output_path,bleedi
                 break
     return([similarity_score,it_J,it_theta,coords_q_log])
 
-def BSpline_GD(coords_q,coords_r,cov_anchor_it,iterations,output_path,bleeding, dist_penalty = 0, alpha_basis = 1000,diff_step = 50,mesh_size = 5,prefix = 'test',mesh_weight = None,attention_params = [None,3,1,0],scale_t = 1,coords_log = False, index_list = None, mid_visual = False,max_xy = None,renew_mesh_trans = True,restriction_t = 0.5):
+def BSpline_GD(coords_q,coords_r,
+                    emb_q, emb_r, corr_clip,
+               cov_anchor_it,iterations,output_path,bleeding, dist_penalty = 0, alpha_basis = 1000,diff_step = 50,mesh_size = 5,prefix = 'test',mesh_weight = None,attention_params = [None,3,1,0],scale_t = 1,coords_log = False, index_list = None, mid_visual = False,max_xy = None,renew_mesh_trans = True,restriction_t = 0.5):
     idx_q = np.ones(coords_q.shape[0],dtype=bool) if index_list is None else index_list[0]
     idx_r = np.ones(coords_r.shape[0],dtype=bool) if index_list is None else index_list[1]
     dev = coords_q.device
@@ -152,7 +191,9 @@ def BSpline_GD(coords_q,coords_r,cov_anchor_it,iterations,output_path,bleeding, 
     mesh,mesh_weight,kls,dxy_ffd_all,delta = BSpline_GD_preparation(max_xy,mesh_size,dev,mesh_weight)
     coords_query_it = coords_q.clone()
 
-    similarity_score = [J_cal(coords_query_it[idx_q],coords_r[idx_r],cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()]
+    similarity_score = [J_cal(coords_query_it[idx_q],coords_r[idx_r],
+                                emb_q, emb_r, corr_clip,
+                              cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()]
     mesh_trans_list = []
     coords_q_log = []
     mesh_trans = mesh.clone()
@@ -161,6 +202,7 @@ def BSpline_GD(coords_q,coords_r,cov_anchor_it,iterations,output_path,bleeding, 
     for it in t:
         dJ_dxy_mat = dJ_dt_cal(coords_query_it[idx_q],
                 coords_r[idx_r],
+                    emb_q, emb_r, corr_clip,
                 diff_step,
                 dev,
                 cov_anchor_it,
@@ -174,7 +216,7 @@ def BSpline_GD(coords_q,coords_r,cov_anchor_it,iterations,output_path,bleeding, 
 
         result_B_t = B_matrix(uv,kls) ## 16 * N[idx]
         dxy_ffd = get_dxy_ffd(ij,result_B_t,mesh,dJ_dxy_mat,mesh_weight,alpha_basis)
-        
+
         if renew_mesh_trans:
             mesh_trans = mesh + dxy_ffd
         else:
@@ -183,7 +225,9 @@ def BSpline_GD(coords_q,coords_r,cov_anchor_it,iterations,output_path,bleeding, 
         coords_query_it = BSpline_renew_coords(uv_raw,kls,ij_raw,mesh_trans)
         if coords_log:
             coords_q_log.append(coords_query_it.detach().cpu().numpy())
-        sscore_t = J_cal(coords_query_it[idx_q],coords_r[idx_r],cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()
+        sscore_t = J_cal(coords_query_it[idx_q],coords_r[idx_r],
+                         emb_q, emb_r, corr_clip,
+                         cov_anchor_it,bleeding,dist_penalty,attention_params).sum().cpu().item()
         # print(f'Loss: {sscore_t}')
         t.set_description(f'Loss: {sscore_t:.3f}')
         t.refresh()
@@ -215,21 +259,35 @@ def BSpline_GD(coords_q,coords_r,cov_anchor_it,iterations,output_path,bleeding, 
     plt.savefig(os.path.join(output_path,prefix + '_after_Bspline_' + str(iterations) + '.pdf'))
     return([coords_query_it,mesh_trans_list,dxy_ffd_all,similarity_score,coords_q_log])
 
-def J_cal(coords_q,coords_r,cov_mat,bleeding = 10, dist_penalty = 0,attention_params = [None,3,1,0]):
+
+def corr_dist_pair(x: torch.Tensor, y: torch.Tensor, eps=1e-8, clip=1):
+    x = x - x.mean(1, keepdim=True)
+    y = y - y.mean(1, keepdim=True)
+    cov = torch.sum(x * y, dim=1)
+    corr = cov / (torch.norm(x, dim=1) * torch.norm(y, dim=1) + eps)
+    return clip - corr
+
+
+def J_cal(coords_q,coords_r, emb_q, emb_r, corr_clip, cov_mat=None,bleeding = 10, dist_penalty = 0,attention_params = [None,3,1,0]):
     attention_region,double_penalty,penalty_inc_all,penalty_inc_both = attention_params
-    bleeding_x = coords_q[:, 0].min() - bleeding, coords_q[:, 0].max() + bleeding
-    bleeding_y = coords_q[:, 1].min() - bleeding, coords_q[:, 1].max() + bleeding
 
-    sub_ind = ((coords_r[:, 0] > bleeding_x[0]) & (coords_r[:, 0] < bleeding_x[1]) &
-               (coords_r[:, 1] > bleeding_y[0]) & (coords_r[:, 1] < bleeding_y[1]))
-    
-    cov_mat_t = cov_mat[:,sub_ind]
-    dist = torch.cdist(coords_q,coords_r[sub_ind,:])
-    min_dist_values, close_idx = torch.min(dist, dim=1)
+    device = coords_q.device
+    min_dist_values, close_idx = KDTree(coords_r.cpu()).query(
+        coords_q.cpu(), k=1
+    )
 
-    tmp1 = torch.stack((torch.arange(coords_q.shape[0], device=coords_q.device), close_idx)).T
-    s_score_mat = cov_mat_t[tmp1[:, 0], tmp1[:, 1]]
-    
+    # import pdb
+    # pdb.set_trace()
+    if cov_mat is not None:
+        cov_mat_t = cov_mat
+        s_score_mat = cov_mat_t[torch.arange(coords_q.shape[0]), close_idx.squeeze()]
+    else:
+        s_score_mat = corr_dist_pair(emb_q.to(device),
+                                     emb_r[close_idx.squeeze()].to(device),
+                                     clip=corr_clip,
+                                     )
+
+
     if(dist_penalty != 0):
         penalty_tres = torch.sqrt((coords_r[:,0].max() - coords_r[:,0].min()) * (coords_r[:,1].max() - coords_r[:,1].min()) / coords_r.shape[0])
         dist_d = min_dist_values / penalty_tres
@@ -249,27 +307,31 @@ def J_cal(coords_q,coords_r,cov_mat,bleeding = 10, dist_penalty = 0,attention_pa
 def alpha_init(alpha_basis,it,dev):
     return 5/torch.pow(torch.Tensor([it/40 + 1]).to(dev),0.6) * alpha_basis
 
-def dJ_dt_cal(coords_q,coords_r,diff_step,dev,cov_anchor_it,bleeding,dist_penalty,attention_params):
+def dJ_dt_cal(coords_q,coords_r, emb_q, emb_r, corr_clip, diff_step,dev,cov_anchor_it,bleeding,dist_penalty,attention_params):
     dJ_dy = (J_cal(coords_q + torch.tensor([0,diff_step], device=dev),
                           coords_r,
+                    emb_q, emb_r, corr_clip,
                           cov_anchor_it,
                           bleeding,
                           dist_penalty,
-                          attention_params) - 
+                          attention_params) -
                J_cal(coords_q + torch.tensor([0,-diff_step], device=dev),
                           coords_r,
+                    emb_q, emb_r, corr_clip,
                           cov_anchor_it,
                           bleeding,
                           dist_penalty,
                           attention_params)) / (2 * diff_step)
     dJ_dx = (J_cal(coords_q + torch.tensor([diff_step,0], device=dev),
                           coords_r,
+                    emb_q, emb_r, corr_clip,
                           cov_anchor_it,
                           bleeding,
                           dist_penalty,
-                          attention_params) - 
+                          attention_params) -
                J_cal(coords_q + torch.tensor([-diff_step,0], device=dev),
                           coords_r,
+                    emb_q, emb_r, corr_clip,
                           cov_anchor_it,
                           bleeding,
                           dist_penalty,
@@ -291,7 +353,7 @@ def dJ_dtheta_cal(xi,yi,dJ_dxy_mat,theta,dev,ifrigid = False):
     #{0, 1}
 
     # when we set d = a (rigid):
-    #dxy_da 
+    #dxy_da
     #{x * cos(rad_phi) - y * sin(rad_phi), y * cos(rad_phi) + x * sin(rad_phi)}
     #dxy_dd - set as the same value as dxy_da
     #{x * cos(rad_phi) - y * sin(rad_phi), y * cos(rad_phi) + x * sin(rad_phi)}
@@ -335,6 +397,8 @@ def dJ_dtheta_cal(xi,yi,dJ_dxy_mat,theta,dev,ifrigid = False):
                 zeros, #dxy_dt1
                 ones])]) #dxy_dt2
 
+    # import pdb
+    # pdb.set_trace()
     dJ_dtheta = torch.bmm(dxy_dtheta.permute(2, 1, 0), ### [N,5,2]
                           dJ_dxy_mat.transpose(0, 1).unsqueeze(-1) ### [N,2,1]
                           ).squeeze(2) # [dJ_{i}/dtheta_{k}] (N * 5)
@@ -343,12 +407,12 @@ def dJ_dtheta_cal(xi,yi,dJ_dxy_mat,theta,dev,ifrigid = False):
     return dJ_dtheta
 
 def theta_renew(theta,dJ_dtheta,alpha,ifrigid = False):
-    alpha_dJ = alpha * dJ_dtheta.reshape(5,1)
+    alpha_dJ = alpha.reshape(5, 1) * dJ_dtheta.reshape(5,1)
     alpha_dJ[0:3] = alpha_dJ[0:3] / 1000 # avoid dtheta_{abcd} change a lot of x and y
     if ifrigid & (theta[0] == -theta[1]):
         # only when the rigid transformation is allowed, we should check the value of d and a if they are mirrored.
         # if d and a are mirrored (setting in the prelocate `d = d * mirror``), we should set alpha_dJ[1] as the `-alpha_dJ[1]`.
-        alpha_dJ[1] = -alpha_dJ[1] 
+        alpha_dJ[1] = -alpha_dJ[1]
     theta_new = theta - alpha_dJ
     return theta_new
 
@@ -548,7 +612,10 @@ def prelocate_loss_plot(J_t,output_path,prefix = 'test'):
     plt.scatter(x=list(range(0,len(J_t))),y=J_t)
     plt.savefig(f'{output_path}/{prefix}_prelocate_loss.pdf')
 
-def register_result(coords_q,coords_r,cov_anchor_t,bleeding,embed_stack,output_path,k=8,prefix='test',scale_t = 1,index_list = None):
+def register_result(coords_q,coords_r,
+                        emb_q,
+                        emb_r, corr_clip,
+                    bleeding,embed_stack,output_path,k=8,prefix='test',scale_t = 1,index_list = None):
     idx_q = np.ones(coords_q.shape[0],dtype=bool) if index_list is None else index_list[0]
     idx_r = np.ones(coords_r.shape[0],dtype=bool) if index_list is None else index_list[1]
     coords_q = coords_q * scale_t
@@ -584,7 +651,10 @@ def register_result(coords_q,coords_r,cov_anchor_t,bleeding,embed_stack,output_p
     ### panel 3 ###
     plt.figure(figsize=[20,12])
     plt.subplot(1,2,1)
-    t_score = J_cal(torch.from_numpy(coords_q[idx_q]),torch.from_numpy(coords_r[idx_r]),cov_anchor_t,bleeding)
+    t_score = J_cal(torch.from_numpy(coords_q[idx_q]),torch.from_numpy(coords_r[idx_r]),
+                        emb_q,
+                        emb_r, corr_clip,
+                    None,bleeding).cpu().numpy()
     plt.scatter(coords_q[idx_q,0],coords_q[idx_q,1],c=1 - t_score,cmap = 'vlag',vmin = -1,vmax = 1,s = 15,edgecolors='none',alpha=0.5,rasterized=True)
     add_scale_bar(200,'200 µm')
     plt.subplot(1,2,2)
@@ -658,17 +728,38 @@ def coords_minus_min_t(coord_t):
 def max_minus_value_t(corr):
     return corr.max() - corr
 
+def corr_max_chunked(query_np, ref_np, nan_as = 'min'):
+    from sklearn.metrics import pairwise_distances_chunked
+    def chunked_callback(dist_matrix,start):
+        return 1 - dist_matrix
+    chunks = pairwise_distances_chunked(
+        query_np,
+        ref_np,
+        metric='correlation',
+        n_jobs=-1,
+        working_memory=1024,
+        reduce_func=chunked_callback
+    )
+    return np.nanmax([np.nanmax(chunk) for chunk in chunks])
+
 def corr_dist(query_np, ref_np, nan_as = 'min'):
     from sklearn.metrics import pairwise_distances_chunked
     def chunked_callback(dist_matrix,start):
         return 1 - dist_matrix
-    chunks = pairwise_distances_chunked(query_np, ref_np, metric='correlation', n_jobs=-1, working_memory=1024, reduce_func=chunked_callback)
+    chunks = pairwise_distances_chunked(
+        query_np,
+        ref_np,
+        metric='correlation',
+        n_jobs=-1,
+        working_memory=1024,
+        reduce_func=chunked_callback
+    )
     corr_q_r = np.vstack(list(chunks))
     if nan_as == 'min':
         corr_q_r[np.isnan(corr_q_r)] = np.nanmin(corr_q_r)
     return corr_q_r
 
-def region_detect(embed_dict_t,coords0,k = 20):
+def region_detect(embed_dict_t, coords0,k = 20):
     plot_row = int(np.floor((k+1)/4) + 1)
     kmeans = KMeans(n_clusters=k,random_state=0).fit(embed_dict_t)
     cell_label = kmeans.labels_

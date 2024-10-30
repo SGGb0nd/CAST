@@ -1,0 +1,7 @@
+*egg-info/
+test*
+**/__pycache__/
+*.pdf
+E2*/
+CAST/E2*/
+CAST-rust/
