@@ -122,7 +122,6 @@ def CAST_STACK(coords_raw, embed_dict, output_path, graph_list, params_dist= Non
     coords_ref = coords_ref.float()
     coords_query = coords_query.float()
 
-    emb_q = embed_dict[query_sample]
     if not isinstance(emb_q := embed_dict[query_sample], torch.Tensor):
         emb_q = torch.from_numpy(emb_q)
 
